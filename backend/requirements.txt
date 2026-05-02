@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+qdrant-client
+langchain
+langchain-ollama
+langchain-community
+langchain-qdrant
+langchain-text-splitters
+opencv-python
+pytesseract
+pdf2image
+openai-whisper
+numpy
+pillow
+docx2txt
+pypdf
