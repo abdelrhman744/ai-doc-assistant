@@ -134,16 +134,17 @@ def _detect_language(converted_path: str) -> str:
 def _initial_prompt(lang: str) -> str:
     if lang == "ar":
         return (
-            "هذا تسجيل صوتي باللغة العربية. "
-            "اكتب الكلام كما هو بدون ترجمة. "
-            "حافظ على المعنى الأصلي للكلام. "
-            "إذا كان الكلام باللهجة المصرية فاكتبه بالعربية الواضحة القريبة من النطق."
+            "هذا تسجيل صوتي باللغة العربية، غالباً باللهجة المصرية. "
+            "اكتب الكلام كما قيل بدون ترجمة. "
+            "صحّح الكلمات الشائعة إذا كانت واضحة من السياق. "
+            "مثال: إذا سمعت ما يشبه 'كل تلك قدم' والمقصود واضح، فاكتب 'كرة القدم'. "
+            "حافظ على المصطلحات الإنجليزية كما هي."
         )
 
     return (
         "Transcribe the speech exactly. "
         "Do not translate. "
-        "Keep the original meaning."
+        "Keep technical English terms as they are."
     )
 
 
@@ -175,11 +176,9 @@ def transcribe_audio(audio_bytes: bytes, language: Optional[str] = None) -> str:
 
         model = _get_model()
 
-        # لو المستخدم اختار ar أو en نثبّت اللغة
-        # لو auto نسيب Whisper يحدد بنفسه
         forced_lang = language if language in {"ar", "en"} else None
 
-        kwargs = {
+        base_kwargs = {
             "fp16": False,
             "task": "transcribe",
             "temperature": 0.0,
@@ -188,11 +187,37 @@ def transcribe_audio(audio_bytes: bytes, language: Optional[str] = None) -> str:
             "best_of": 5,
         }
 
+        # Manual language selection: force selected language.
         if forced_lang:
-            kwargs["language"] = forced_lang
-            kwargs["initial_prompt"] = _initial_prompt(forced_lang)
+            result = model.transcribe(
+                converted_path,
+                language=forced_lang,
+                initial_prompt=_initial_prompt(forced_lang),
+                **base_kwargs,
+            )
+        else:
+            # Auto mode: let Whisper detect language so English does not get forced to Arabic.
+            result = model.transcribe(converted_path, **base_kwargs)
 
-        result = model.transcribe(converted_path, **kwargs)
+            detected_auto = result.get("language", "auto")
+            text_auto = (result.get("text") or "").strip()
+
+            # If Whisper detected Arabic, run one Arabic-guided pass to improve Egyptian Arabic words.
+            # This does not affect English because it only happens after Whisper says the audio is Arabic.
+            if detected_auto == "ar":
+                try:
+                    result_ar = model.transcribe(
+                        converted_path,
+                        language="ar",
+                        initial_prompt=_initial_prompt("ar"),
+                        **base_kwargs,
+                    )
+                    text_ar = (result_ar.get("text") or "").strip()
+
+                    if len(text_ar) >= max(3, int(len(text_auto) * 0.6)):
+                        result = result_ar
+                except Exception as e:
+                    log.warning(f"Arabic second-pass transcription failed: {e}")
 
         text = (result.get("text") or "").strip()
         detected_lang = result.get("language", forced_lang or "auto")

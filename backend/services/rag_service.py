@@ -252,61 +252,145 @@ def _rephrase(query: str, lang: str) -> str:
     except Exception:
         return ""
 
+
 def _is_mixed_language(text: str) -> bool:
     return bool(re.search(r"[\u0600-\u06FF]", text or "")) and bool(re.search(r"[a-zA-Z]", text or ""))
 
-def _query_variants(question: str, lang: str) -> List[str]:
-    q = _clean(question)
 
+def _loose_arabic(text: str) -> str:
+    """
+    Extra-tolerant Arabic normalization for typo-heavy user questions.
+    Examples:
+    - كرة / كره
+    - أركان / اركان
+    - الإسلام / الاسلام
+    """
+    text = _normalize_arabic(text)
+    text = re.sub(r"\bال", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _loose_english(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+@lru_cache(maxsize=256)
+def _fix_query_spelling(query: str, lang: str) -> str:
+    """
+    Lightweight LLM spelling correction.
+    Used only to create extra retrieval variants; it never replaces the user's original question.
+    """
+    query = _clean(query)
+    if not query:
+        return ""
+
+    if lang == "ar":
+        prompt = f"""صحح الأخطاء الإملائية في السؤال التالي بدون تغيير المعنى.
+أعد السؤال فقط بدون شرح أو مقدمات:
+
+{query}"""
+    else:
+        prompt = f"""Correct spelling mistakes in this question without changing its meaning.
+Return only the corrected question, no explanation:
+
+{query}"""
+
+    try:
+        out = str(llm.invoke(prompt)).strip()
+        return _clean(out.splitlines()[0])
+    except Exception as e:
+        log.warning(f"Spelling correction failed: {e}")
+        return ""
+
+
+def _query_variants(question: str, lang: str) -> List[str]:
+    """
+    Build robust retrieval variants:
+    - original query
+    - normalized Arabic / lowercase English
+    - typo-corrected query
+    - Arabic ↔ English translations
+    - rephrases
+    """
+    q = _clean(question)
     if not q:
         return []
 
-    variants = []
+    variants: List[str] = []
 
     def add(x: str):
         x = _clean(x)
         if x and x not in variants:
             variants.append(x)
 
+    detected = detect_language(q)
+
     add(q)
+    add(_normalize(q))
 
-    if _is_mixed_language(q):
+    if detected == "ar" or _is_mixed_language(q):
         add(_normalize_arabic(q))
-        add(q.lower())
-
-        tr_en = _translate(q, "en")
-        tr_ar = _translate(q, "ar")
-
-        add(tr_en)
-        add(tr_en.lower())
-        add(tr_ar)
-        add(_normalize_arabic(tr_ar))
-
-    elif detect_language(q) == "ar":
-        add(_normalize_arabic(q))
-
-        tr_en = _translate(q, "en")
-        add(tr_en)
-        add(tr_en.lower())
-
-        rp_en = _rephrase(tr_en, "en") if tr_en else ""
-        add(rp_en)
-
+        add(_loose_arabic(q))
     else:
         add(q.lower())
+        add(_loose_english(q))
 
-        tr_ar = _translate(q, "ar")
+    fixed = _fix_query_spelling(q, detected)
+    if fixed:
+        add(fixed)
+        add(_normalize(fixed))
+        if detect_language(fixed) == "ar":
+            add(_normalize_arabic(fixed))
+            add(_loose_arabic(fixed))
+        else:
+            add(fixed.lower())
+            add(_loose_english(fixed))
+
+    # Always try Arabic -> English
+    tr_en = _translate(q, "en")
+    if tr_en:
+        add(tr_en)
+        add(tr_en.lower())
+        add(_loose_english(tr_en))
+
+        fixed_en = _fix_query_spelling(tr_en, "en")
+        if fixed_en:
+            add(fixed_en)
+            add(fixed_en.lower())
+            add(_loose_english(fixed_en))
+
+        rp_en = _rephrase(tr_en, "en")
+        if rp_en:
+            add(rp_en)
+            add(rp_en.lower())
+            add(_loose_english(rp_en))
+
+    # Always try English -> Arabic
+    tr_ar = _translate(q, "ar")
+    if tr_ar:
         add(tr_ar)
         add(_normalize_arabic(tr_ar))
+        add(_loose_arabic(tr_ar))
 
-        rp_ar = _rephrase(tr_ar, "ar") if tr_ar else ""
-        add(rp_ar)
-        add(_normalize_arabic(rp_ar))
+        fixed_ar = _fix_query_spelling(tr_ar, "ar")
+        if fixed_ar:
+            add(fixed_ar)
+            add(_normalize_arabic(fixed_ar))
+            add(_loose_arabic(fixed_ar))
 
-    return variants[:12]
+        rp_ar = _rephrase(tr_ar, "ar")
+        if rp_ar:
+            add(rp_ar)
+            add(_normalize_arabic(rp_ar))
+            add(_loose_arabic(rp_ar))
+
+    return variants[:18]
 
 
-# ── Lexical scoring ────────────────────────────────────────────────────────────
+# ── Lexical scoring# ── Lexical scoring ────────────────────────────────────────────────────────────
 
 def _lex_score(query: str, doc_text: str, lang: str) -> float:
     kws = _keywords(query, lang)
@@ -349,38 +433,56 @@ def _confidence(question: str, docs: List[Document], lang: str) -> float:
 
 # ── Reranking ──────────────────────────────────────────────────────────────────
 
+
 def _rerank(variants: List[str], docs: List[Document]) -> Tuple[List[Document], List[dict]]:
+    """
+    Rerank without throwing away vector-search results.
+    This is important for Arabic ↔ English cross-language questions and typo-heavy queries.
+    """
     scored = []
+
     for idx, d in enumerate(docs):
         content = _clean(d.page_content)
         if not _is_meaningful(content):
             continue
-        max_lex   = 0.0
-        best_var  = ""
-        for qv in variants:
-            s = _lex_score(qv, content, detect_language(qv))
-            if s > max_lex:
-                max_lex, best_var = s, qv
 
-        head        = _normalize(content[:300])
-        bonus_head  = sum(0.05 for qv in variants[:3] for kw in _keywords(qv, detect_language(qv)) if kw in head)
-        bonus_bi    = sum(0.08 for qv in variants[:2] for bg in _ngrams(qv, 2) if bg in _normalize(content))
-        final_score = max_lex + bonus_head + bonus_bi - idx * 0.002
+        max_lex = 0.0
+
+        for qv in variants:
+            q_lang = detect_language(qv)
+            s = _lex_score(qv, content, q_lang)
+
+            if q_lang == "ar":
+                loose_q = _loose_arabic(qv)
+                loose_doc = _loose_arabic(content)
+                kws = [w for w in loose_q.split() if len(w) > 2]
+                if kws:
+                    loose_score = sum(1 for kw in kws if kw in loose_doc) / len(kws)
+                    s = max(s, loose_score)
+            else:
+                loose_q = _loose_english(qv)
+                loose_doc = _loose_english(content)
+                kws = [w for w in loose_q.split() if len(w) > 2]
+                if kws:
+                    loose_score = sum(1 for kw in kws if kw in loose_doc) / len(kws)
+                    s = max(s, loose_score)
+
+            max_lex = max(max_lex, s)
+
+        # Keep vector-search ordering as fallback even if lexical score is low.
+        final_score = max_lex - idx * 0.001
 
         scored.append((final_score, d, {
-            "source":  d.metadata.get("source", "?"),
-            "page":    d.metadata.get("page", 0),
-            "score":   round(final_score, 4),
+            "source": d.metadata.get("source", "?"),
+            "page": d.metadata.get("page", 0),
+            "score": round(final_score, 4),
             "preview": content[:120].replace("\n", " "),
         }))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    ranked = [d for s, d, _ in scored if s > 0]
-    debugs = [dbg for s, _, dbg in scored if s > 0]
 
-    if not ranked:
-        ranked = [d for _, d, _ in scored[:RERANK_TOP_N]]
-        debugs = [dbg for _, _, dbg in scored[:RERANK_TOP_N]]
+    ranked = [d for _, d, _ in scored]
+    debugs = [dbg for _, _, dbg in scored]
 
     return ranked[:RERANK_TOP_N], debugs[:RERANK_TOP_N]
 
@@ -400,55 +502,54 @@ def _retrieve(question: str, lang: str) -> Tuple[List[Document], str]:
         except Exception as e:
             log.error(f"Retrieval error for '{q}': {e}")
 
+    # Fallback for very typo-heavy or short queries
+    if not all_docs:
+        simplified = " ".join(
+            re.findall(r"[\u0600-\u06FFa-zA-Z]{2,}", _normalize(question))[:8]
+        )
+        if simplified:
+            try:
+                all_docs.extend(_retriever.invoke(simplified))
+            except Exception as e:
+                log.error(f"Fallback retrieval error: {e}")
+
     all_docs = _deduplicate_retrieved(all_docs)
+
+    if not all_docs:
+        return [], "no docs retrieved"
 
     ranked, debugs = _rerank(variants, all_docs)
 
-    # fallback: لو rerank رجع فاضي، استخدم أول docs راجعة من vector search
-    if not ranked and all_docs:
-        ranked = all_docs[:RERANK_TOP_N]
-        debugs = [{
-            "source": d.metadata.get("source", "?"),
-            "page": d.metadata.get("page", 0),
-            "score": 0,
-            "preview": _clean(d.page_content)[:120].replace("\n", " "),
-        } for d in ranked]
-
     debug_str = "\n".join(
-        f"Rank {i+1}: {d['source']} p{d['page']} score={d['score']} | {d['preview'][:60]}"
+        f"Rank {i+1}: {d['source']} p{d['page']} score={d['score']} | {d['preview'][:80]}"
         for i, d in enumerate(debugs)
     )
 
     return ranked[:RERANK_TOP_N], debug_str
 
 
-# ── Prompt & cleanup ───────────────────────────────────────────────────────────
+# ── Prompt & cleanup# ── Prompt & cleanup ───────────────────────────────────────────────────────────
 
 def build_prompt(context: str, question: str, lang: str) -> str:
     if lang == "ar":
-        return f"""أنت نظام استخراج معلومات متقدم. مهمتك: استخرج إجابة كاملة ومفصّلة من السياق المقدم.
+        return f"""أنت نظام استخراج معلومات متقدم. مهمتك: استخرج إجابة كاملة ومفصّلة من السياق المقدم فقط.
 
 **قواعد الإجابة — يجب اتباعها بدقة:**
 
 1. اقرأ السياق كاملاً قبل الكتابة.
-2. إذا وُجدت المعلومة كاملةً في السياق:
-   - قدّم إجابة واضحة ومفصّلة (3 جمل على الأقل إذا أمكن).
-   - استخدم فقرات منظّمة أو نقاط (•) عند الحديث عن قوائم أو خطوات.
-   - اذكر الأرقام والتواريخ والأسماء كما وردت حرفياً في السياق.
-3. إذا وُجدت المعلومة جزئياً في السياق:
-   - أجب بما هو موجود فعلاً، ثم وضّح باختصار ما لم يُذكر في الملفات.
-4. إذا لم تُوجد المعلومة إطلاقاً:
-   - قل فقط: "المعلومة غير موجودة في الملفات المرفوعة."
-5. لا تبدأ بعبارات مثل "بناءً على السياق..." أو "وفقاً للمعلومات...".
-6. لا تكرر السؤال في الإجابة.
-7. لا تستخدم أي معرفة خارجية.
-8. الإجابة بالعربية الفصحى الواضحة.
-9. بعد الإجابة، قدّم مثال بسيط يوضح الفكرة.
-10. استخدم تنسيق:
+2. السؤال قد يكون بالعربية والسياق بالإنجليزية أو العكس؛ افهم المعنى بين اللغتين.
+3. السؤال قد يحتوي على أخطاء إملائية أو حروف ناقصة أو كلمات عامية؛ حاول فهم المقصود من السياق.
+4. إذا وجدت معلومة مرتبطة أو قريبة جدًا من السؤال في السياق، أجب بها ولا تقل إن المعلومة غير موجودة.
+5. لا تقل "المعلومة غير موجودة في الملفات المرفوعة" إلا إذا كان السياق لا يحتوي على أي معلومة مرتبطة بالسؤال نهائيًا.
+6. لا تستخدم أي معرفة خارجية خارج السياق.
+7. لا تبدأ بعبارات مثل "بناءً على السياق" أو "وفقاً للمعلومات".
+8. لا تكرر السؤال في الإجابة.
+9. اذكر الأرقام والتواريخ والأسماء كما وردت في السياق.
+10. الإجابة بالعربية الواضحة، مع الحفاظ على المصطلحات الإنجليزية المهمة كما هي.
+11. بعد الإجابة، قدم مثالًا بسيطًا إذا كان مناسبًا.
+12. استخدم تنسيق:
     - الشرح:
     - المثال:
-11. قد يكون السؤال بالعربية والسياق بالإنجليزية أو العكس. افهم المعنى بين اللغتين وأجب بلغة السؤال الأساسية.
-12. إذا كان السؤال يحتوي على عربي وإنجليزي معًا، اعتبر المصطلحات الإنجليزية جزءًا من السؤال ولا تترجمها ترجمة خاطئة.
 
 **السياق:**
 {context}
@@ -458,29 +559,24 @@ def build_prompt(context: str, question: str, lang: str) -> str:
 
 **الإجابة الكاملة:**"""
 
-    return f"""You are an advanced information extraction system. Your task: extract a complete, well-structured answer from the provided context.
+    return f"""You are an advanced information extraction system. Your task is to extract a complete, well-structured answer from the provided context only.
 
 **Answering rules — follow precisely:**
 
 1. Read the entire context before writing.
-2. If the information is fully present in the context:
-   - Provide a clear, detailed answer (at least 3 sentences when possible).
-   - Use organized paragraphs or bullet points (•) for lists or step-by-step content.
-   - State numbers, dates, and names exactly as they appear in the context.
-3. If the information is only partially present:
-   - Answer with what IS in the context, then briefly note what is missing from the documents.
-4. If the information is entirely absent:
-   - Say only: "The information is not available in the uploaded files."
-5. Do NOT open with "Based on the context..." or "According to the information...".
-6. Do NOT repeat the question in the answer.
-7. Do NOT use any knowledge from outside the context below.
-8. Answer in clear, professional English.
-9. After the answer, provide a simple example.
-10. Use format:
+2. The question and context may be in different languages. Understand the meaning across Arabic and English.
+3. The question may contain spelling mistakes, missing letters, dialect words, or mixed Arabic/English terms. Infer the intended meaning from the context.
+4. If the context contains related or very close information, answer using it. Do not say it is unavailable.
+5. Only say "The information is not available in the uploaded files." if the context has no related information at all.
+6. Do not use external knowledge outside the context.
+7. Do not open with "Based on the context" or "According to the information".
+8. Do not repeat the question.
+9. State numbers, dates, and names exactly as they appear in the context.
+10. Answer in clear English, preserving important Arabic or English technical terms when needed.
+11. After the answer, provide a simple example if useful.
+12. Use format:
    - Explanation:
    - Example:
-11. The question and context may be in different languages. Understand the meaning across Arabic and English.
-12. If the question mixes Arabic and English, preserve technical English terms and answer in the dominant language of the question.
 
 **Context:**
 {context}
@@ -836,3 +932,146 @@ def ask_question(query: str, lang: str = "auto") -> dict:
         answer = f"Error generating answer: {e}"
 
     return {"answer": answer, "sources": _build_sources(docs, detected_lang)}
+
+
+def generate_quiz(
+    topic: str = "",
+    num_questions: int = 5,
+    question_type: str = "mixed",
+    lang: str = "auto",
+) -> dict:
+    """
+    Generate a quiz from uploaded documents using existing Qdrant retriever.
+    Works with Arabic, English, mixed questions, and minor spelling mistakes.
+    """
+
+    if _retriever is None:
+        load_existing_db()
+
+    if _retriever is None:
+        return {
+            "quiz": "⚠️ Database is empty. Please upload files first.",
+            "sources": "",
+        }
+
+    topic = _clean(topic)
+    num_questions = max(1, min(int(num_questions), 20))
+
+    detected_lang = detect_language(topic) if lang == "auto" and topic else lang
+    if detected_lang == "auto":
+        detected_lang = "en"
+
+    search_query = topic if topic else "summary key concepts main ideas important information"
+
+    docs, debug = _retrieve(search_query, detected_lang)
+    log.debug(f"Quiz retrieval:\n{debug}")
+
+    if not docs:
+        msg = (
+            "المعلومة غير موجودة في الملفات المرفوعة."
+            if detected_lang == "ar"
+            else "The information is not available in the uploaded files."
+        )
+        return {"quiz": msg, "sources": ""}
+
+    context_parts = [
+        f"[Chunk {i+1} | {d.metadata.get('source','?')} | page {d.metadata.get('page',0)}]\n{d.page_content}"
+        for i, d in enumerate(docs)
+    ]
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    if detected_lang == "ar":
+        prompt = f"""
+أنت منشئ اختبارات تعليمي محترف.
+
+مهمتك: أنشئ اختبارًا من الملفات المرفوعة فقط.
+
+القواعد:
+1. استخدم المعلومات الموجودة في السياق فقط.
+2. لا تستخدم معرفة خارجية.
+3. الموضوع قد يكون مكتوبًا بالعربية والسياق بالإنجليزية أو العكس؛ افهم المعنى بين اللغتين.
+4. الموضوع قد يحتوي على أخطاء إملائية بسيطة؛ استنتج المقصود من السياق.
+5. إذا وجدت معلومات قريبة من الموضوع في السياق، أنشئ الاختبار منها ولا تقل إن المعلومة غير موجودة.
+6. عدد الأسئلة المطلوب: {num_questions}.
+7. نوع الأسئلة: {question_type}.
+8. إذا كان النوع mcq، اجعل كل الأسئلة اختيارًا من متعدد.
+9. إذا كان النوع true_false، اجعل كل الأسئلة صح أو خطأ.
+10. إذا كان النوع short_answer، اجعل كل الأسئلة إجابة قصيرة.
+11. إذا كان النوع mixed، اخلط بين اختيار من متعدد وصح/خطأ وإجابة قصيرة.
+12. في أسئلة الاختيار من متعدد، اكتب 4 اختيارات A, B, C, D.
+13. بعد كل سؤال، اكتب Answer ثم Explanation.
+14. اكتب بالعربية الواضحة، واترك المصطلحات الإنجليزية المهمة كما هي.
+
+السياق:
+{context}
+
+الموضوع المطلوب:
+{topic or "اختبار عام من الملفات"}
+
+اكتب الاختبار بهذا الشكل:
+
+# Quiz
+
+## Question 1
+...
+
+Answer:
+...
+
+Explanation:
+...
+"""
+    else:
+        prompt = f"""
+You are a professional educational quiz generator.
+
+Your task: create a quiz from the uploaded documents only.
+
+Rules:
+1. Use only the provided context.
+2. Do not use external knowledge.
+3. The topic may be Arabic while the context is English, or the opposite. Understand meaning across languages.
+4. The topic may contain minor spelling mistakes. Infer the intended meaning from the context.
+5. If the context contains related information, create the quiz from it. Do not say it is unavailable.
+6. Number of questions: {num_questions}.
+7. Question type: {question_type}.
+8. If the type is mcq, make all questions multiple choice.
+9. If the type is true_false, make all questions True / False.
+10. If the type is short_answer, make all questions short answer.
+11. If the type is mixed, include multiple choice, True / False, and short answer.
+12. For MCQs, provide 4 options: A, B, C, D.
+13. After each question, provide Answer and Explanation.
+14. Answer in clear English, preserving important Arabic or English technical terms when needed.
+
+Context:
+{context}
+
+Requested topic:
+{topic or "General quiz from uploaded files"}
+
+Format:
+
+# Quiz
+
+## Question 1
+...
+
+Answer:
+...
+
+Explanation:
+...
+"""
+
+    try:
+        answer = str(llm.invoke(prompt)).strip()
+        answer = _clean_answer(answer, detected_lang)
+    except Exception as e:
+        log.error(f"Quiz generation error: {e}")
+        answer = f"Error generating quiz: {e}"
+
+    return {
+        "quiz": answer,
+        "sources": _build_sources(docs, detected_lang),
+    }

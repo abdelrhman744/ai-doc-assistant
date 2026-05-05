@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from routes.quiz import router as quiz_router
 
 from routes.upload import router as upload_router
 from routes.chat import router as chat_router
@@ -18,6 +19,7 @@ app.add_middleware(
 app.include_router(upload_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(health_router, prefix="/api")
+app.include_router(quiz_router, prefix="/api")
 
 if __name__ == "__main__":
     import uvicorn
